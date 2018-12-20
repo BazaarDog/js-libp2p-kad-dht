@@ -9,12 +9,13 @@ const PeerId = require('peer-id')
 const PeerInfo = require('peer-info')
 const crypto = require('libp2p-crypto')
 
+const errcode = require('err-code')
+
 const RoutingTable = require('./routing')
 const utils = require('./utils')
 const c = require('./constants')
 const Query = require('./query')
 const Network = require('./network')
-const errors = require('./errors')
 const privateApi = require('./private')
 const Providers = require('./providers')
 const Message = require('./message')
@@ -22,7 +23,7 @@ const RandomWalk = require('./random-walk')
 const assert = require('assert')
 
 /**
- * A DHT implementation modeled after Kademlia with Coral and S/Kademlia modifications.
+ * A DHT implementation modeled after Kademlia with S/Kademlia modifications.
  *
  * Original implementation in go: https://github.com/libp2p/go-libp2p-kad-dht.
  */
@@ -30,12 +31,19 @@ class KadDHT {
   /**
    * Create a new KadDHT.
    *
-   * @param {Switch} sw
-   * @param {object} options // {kBucketSize=20, datastore=MemoryDatastore}
+   * @param {Switch} sw libp2p-switch instance
+   * @param {object} options DHT options
+   * @param {number} options.kBucketSize k-bucket size (default 20)
+   * @param {Datastore} options.datastore datastore (default MemoryDatastore)
+   * @param {boolean} options.enabledDiscovery enable dht discovery (default true)
+   * @param {object} options.validators validators object with namespace as keys and function(key, record, callback)
+   * @param {object} options.selectors selectors object with namespace as keys and function(key, records)
    */
   constructor (sw, options) {
     assert(sw, 'libp2p-kad-dht requires a instance of Switch')
     options = options || {}
+    options.validators = options.validators
+    options.selectors = options.selectors
 
     /**
      * Local reference to the libp2p-switch instance
@@ -79,8 +87,15 @@ class KadDHT {
      */
     this.providers = new Providers(this.datastore, this.peerInfo.id)
 
-    this.validators = { pk: libp2pRecord.validator.validators.pk }
-    this.selectors = { pk: libp2pRecord.selection.selectors.pk }
+    this.validators = {
+      pk: libp2pRecord.validator.validators.pk,
+      ...options.validators
+    }
+
+    this.selectors = {
+      pk: libp2pRecord.selection.selectors.pk,
+      ...options.selectors
+    }
 
     this.network = new Network(this)
 
@@ -96,6 +111,11 @@ class KadDHT {
      * @type {RandomWalk}
      */
     this.randomWalk = new RandomWalk(this)
+
+    /**
+     * Random walk state, default true
+     */
+    this.randomWalkEnabled = !options.hasOwnProperty('enabledDiscovery') ? true : Boolean(options.enabledDiscovery)
   }
 
   /**
@@ -115,7 +135,15 @@ class KadDHT {
    */
   start (callback) {
     this._running = true
-    this.network.start(callback)
+    this.network.start((err) => {
+      if (err) {
+        return callback(err)
+      }
+
+      // Start random walk if enabled
+      this.randomWalkEnabled && this.randomWalk.start()
+      callback()
+    })
   }
 
   /**
@@ -127,9 +155,10 @@ class KadDHT {
    */
   stop (callback) {
     this._running = false
-    this.randomWalk.stop()
-    this.providers.stop()
-    this.network.stop(callback)
+    this.randomWalk.stop(() => { // guarantee that random walk is stopped if it was started
+      this.providers.stop()
+      this.network.stop(callback)
+    })
   }
 
   /**
@@ -154,16 +183,10 @@ class KadDHT {
    * @returns {void}
    */
   put (key, value, callback) {
-    this._log('PutValue %s', key)
-    let sign
-    try {
-      sign = libp2pRecord.validator.isSigned(this.validators, key)
-    } catch (err) {
-      return callback(err)
-    }
+    this._log('PutValue %b', key)
 
     waterfall([
-      (cb) => utils.createPutRecord(key, value, this.peerInfo.id, sign, cb),
+      (cb) => utils.createPutRecord(key, value, cb),
       (rec, cb) => waterfall([
         (cb) => this._putLocal(key, rec, cb),
         (cb) => this.getClosestPeers(key, cb),
@@ -179,21 +202,26 @@ class KadDHT {
    * Times out after 1 minute.
    *
    * @param {Buffer} key
-   * @param {number} [maxTimeout=60000] - optional timeout
+   * @param {Object} options - get options
+   * @param {number} options.timeout - optional timeout (default: 60000)
    * @param {function(Error, Buffer)} callback
    * @returns {void}
    */
-  get (key, maxTimeout, callback) {
-    if (typeof maxTimeout === 'function') {
-      callback = maxTimeout
-      maxTimeout = null
+  get (key, options, callback) {
+    if (typeof options === 'function') {
+      callback = options
+      options = {}
+    } else {
+      options = options || {}
     }
 
-    if (maxTimeout == null) {
-      maxTimeout = c.minute
+    if (!options.maxTimeout && !options.timeout) {
+      options.timeout = c.minute // default
+    } else if (options.maxTimeout && !options.timeout) { // TODO this will be deprecated in a next release
+      options.timeout = options.maxTimeout
     }
 
-    this._get(key, maxTimeout, callback)
+    this._get(key, options, callback)
   }
 
   /**
@@ -201,21 +229,27 @@ class KadDHT {
    *
    * @param {Buffer} key
    * @param {number} nvals
-   * @param {number} [maxTimeout=60000]
+   * @param {Object} options - get options
+   * @param {number} options.timeout - optional timeout (default: 60000)
    * @param {function(Error, Array<{from: PeerId, val: Buffer}>)} callback
    * @returns {void}
    */
-  getMany (key, nvals, maxTimeout, callback) {
-    if (typeof maxTimeout === 'function') {
-      callback = maxTimeout
-      maxTimeout = null
-    }
-    if (maxTimeout == null) {
-      maxTimeout = c.minute
+  getMany (key, nvals, options, callback) {
+    if (typeof options === 'function') {
+      callback = options
+      options = {}
+    } else {
+      options = options || {}
     }
 
-    this._log('getMany %s (%s)', key, nvals)
-    const vals = []
+    if (!options.maxTimeout && !options.timeout) {
+      options.timeout = c.minute // default
+    } else if (options.maxTimeout && !options.timeout) { // TODO this will be deprecated in a next release
+      options.timeout = options.maxTimeout
+    }
+
+    this._log('getMany %b (%s)', key, nvals)
+    let vals = []
 
     this._getLocal(key, (err, localRec) => {
       if (err && nvals === 0) {
@@ -233,6 +267,7 @@ class KadDHT {
         return callback(null, vals)
       }
 
+      const paths = []
       waterfall([
         (cb) => utils.convertBuffer(key, cb),
         (id, cb) => {
@@ -240,43 +275,55 @@ class KadDHT {
 
           this._log('peers in rt: %d', rtp.length)
           if (rtp.length === 0) {
-            this._log.error('No peers from routing table!')
-            return cb(new Error('Failed to lookup key'))
+            const errMsg = 'Failed to lookup key! No peers from routing table!'
+
+            this._log.error(errMsg)
+            return cb(errcode(new Error(errMsg), 'ERR_NO_PEERS_IN_ROUTING_TABLE'))
           }
 
-          // we have peers, lets do the actualy query to them
-          const query = new Query(this, key, (peer, cb) => {
-            this._getValueOrPeers(peer, key, (err, rec, peers) => {
-              if (err) {
-                // If we have an invalid record we just want to continue and fetch a new one.
-                if (!(err instanceof errors.InvalidRecordError)) {
-                  return cb(err)
+          // we have peers, lets do the actual query to them
+          const query = new Query(this, key, (pathIndex, numPaths) => {
+            // This function body runs once per disjoint path
+            const pathSize = utils.pathSize(nvals - vals.length, numPaths)
+            const pathVals = []
+            paths.push(pathVals)
+
+            // Here we return the query function to use on this particular disjoint path
+            return (peer, cb) => {
+              this._getValueOrPeers(peer, key, (err, rec, peers) => {
+                if (err) {
+                  // If we have an invalid record we just want to continue and fetch a new one.
+                  if (!(err.code === 'ERR_INVALID_RECORD')) {
+                    return cb(err)
+                  }
                 }
-              }
 
-              const res = { closerPeers: peers }
+                const res = { closerPeers: peers }
 
-              if ((rec && rec.value) ||
-                  err instanceof errors.InvalidRecordError) {
-                vals.push({
-                  val: rec && rec.value,
-                  from: peer
-                })
-              }
+                if ((rec && rec.value) || (err && err.code === 'ERR_INVALID_RECORD')) {
+                  pathVals.push({
+                    val: rec && rec.value,
+                    from: peer
+                  })
+                }
 
-              // enough is enough
-              if (vals.length >= nvals) {
-                res.success = true
-              }
+                // enough is enough
+                if (pathVals.length >= pathSize) {
+                  res.success = true
+                }
 
-              cb(null, res)
-            })
+                cb(null, res)
+              })
+            }
           })
 
           // run our query
-          timeout((cb) => query.run(rtp, cb), maxTimeout)(cb)
+          timeout((cb) => query.run(rtp, cb), options.timeout)(cb)
         }
       ], (err) => {
+        // combine vals from each path
+        vals = [].concat.apply(vals, paths).slice(0, nvals)
+
         if (err && vals.length === 0) {
           return callback(err)
         }
@@ -294,7 +341,7 @@ class KadDHT {
    * @returns {void}
    */
   getClosestPeers (key, callback) {
-    this._log('getClosestPeers to %s', key.toString())
+    this._log('getClosestPeers to %b', key)
     utils.convertBuffer(key, (err, id) => {
       if (err) {
         return callback(err)
@@ -302,15 +349,20 @@ class KadDHT {
 
       const tablePeers = this.routingTable.closestPeers(id, c.ALPHA)
 
-      const q = new Query(this, key, (peer, callback) => {
-        waterfall([
-          (cb) => this._closerPeersSingle(key, peer, cb),
-          (closer, cb) => {
-            cb(null, {
-              closerPeers: closer
-            })
-          }
-        ], callback)
+      const q = new Query(this, key, () => {
+        // There is no distinction between the disjoint paths,
+        // so there are no per-path variables in this scope.
+        // Just return the actual query function.
+        return (peer, callback) => {
+          waterfall([
+            (cb) => this._closerPeersSingle(key, peer, cb),
+            (closer, cb) => {
+              cb(null, {
+                closerPeers: closer
+              })
+            }
+          ], callback)
+        }
       })
 
       q.run(tablePeers, (err, res) => {
@@ -400,9 +452,7 @@ class KadDHT {
   // ----------- Content Routing
 
   /**
-   * Announce to the network that a node can provide the given key.
-   * This is what Coral and MainlineDHT do to store large values
-   * in a DHT.
+   * Announce to the network that we can provide given key's value.
    *
    * @param {CID} key
    * @param {function(Error)} callback
@@ -430,13 +480,30 @@ class KadDHT {
    * Search the dht for up to `K` providers of the given CID.
    *
    * @param {CID} key
-   * @param {number} timeout - how long the query should maximally run, in milliseconds.
+   * @param {Object} options - findProviders options
+   * @param {number} options.timeout - how long the query should maximally run, in milliseconds (default: 60000)
+   * @param {number} options.maxNumProviders - maximum number of providers to find
    * @param {function(Error, Array<PeerInfo>)} callback
    * @returns {void}
    */
-  findProviders (key, timeout, callback) {
+  findProviders (key, options, callback) {
+    if (typeof options === 'function') {
+      callback = options
+      options = {}
+    } else {
+      options = options || {}
+    }
+
+    if (!options.maxTimeout && !options.timeout) {
+      options.timeout = c.minute // default
+    } else if (options.maxTimeout && !options.timeout) { // TODO this will be deprecated in a next release
+      options.timeout = options.maxTimeout
+    }
+
+    options.maxNumProviders = options.maxNumProviders || c.K
+
     this._log('findProviders %s', key.toBaseEncodedString())
-    this._findNProviders(key, timeout, c.K, callback)
+    this._findNProviders(key, options.timeout, options.maxNumProviders, callback)
   }
 
   // ----------- Peer Routing
@@ -445,18 +512,23 @@ class KadDHT {
    * Search for a peer with the given ID.
    *
    * @param {PeerId} id
-   * @param {number} [maxTimeout=60000]
+   * @param {Object} options - findPeer options
+   * @param {number} options.timeout - how long the query should maximally run, in milliseconds (default: 60000)
    * @param {function(Error, PeerInfo)} callback
    * @returns {void}
    */
-  findPeer (id, maxTimeout, callback) {
-    if (typeof maxTimeout === 'function') {
-      callback = maxTimeout
-      maxTimeout = null
+  findPeer (id, options, callback) {
+    if (typeof options === 'function') {
+      callback = options
+      options = {}
+    } else {
+      options = options || {}
     }
 
-    if (maxTimeout == null) {
-      maxTimeout = c.minute
+    if (!options.maxTimeout && !options.timeout) {
+      options.timeout = c.minute // default
+    } else if (options.maxTimeout && !options.timeout) { // TODO this will be deprecated in a next release
+      options.timeout = options.maxTimeout
     }
 
     this._log('findPeer %s', id.toB58String())
@@ -478,7 +550,7 @@ class KadDHT {
           const peers = this.routingTable.closestPeers(key, c.ALPHA)
 
           if (peers.length === 0) {
-            return cb(new errors.LookupFailureError())
+            return cb(errcode(new Error('Peer lookup failed'), 'ERR_LOOKUP_FAILED'))
           }
 
           // sanity check
@@ -489,37 +561,49 @@ class KadDHT {
           }
 
           // query the network
-          const query = new Query(this, id.id, (peer, cb) => {
-            waterfall([
-              (cb) => this._findPeerSingle(peer, id, cb),
-              (msg, cb) => {
-                const match = msg.closerPeers.find((p) => p.id.isEqual(id))
+          const query = new Query(this, id.id, () => {
+            // There is no distinction between the disjoint paths,
+            // so there are no per-path variables in this scope.
+            // Just return the actual query function.
+            return (peer, cb) => {
+              waterfall([
+                (cb) => this._findPeerSingle(peer, id, cb),
+                (msg, cb) => {
+                  const match = msg.closerPeers.find((p) => p.id.isEqual(id))
 
-                // found it
-                if (match) {
-                  return cb(null, {
-                    peer: match,
-                    success: true
+                  // found it
+                  if (match) {
+                    return cb(null, {
+                      peer: match,
+                      success: true
+                    })
+                  }
+
+                  cb(null, {
+                    closerPeers: msg.closerPeers
                   })
                 }
-
-                cb(null, {
-                  closerPeers: msg.closerPeers
-                })
-              }
-            ], cb)
+              ], cb)
+            }
           })
 
           timeout((cb) => {
             query.run(peers, cb)
-          }, maxTimeout)(cb)
+          }, options.timeout)(cb)
         },
         (result, cb) => {
-          this._log('findPeer %s: %s', id.toB58String(), result.success)
-          if (!result.peer) {
-            return cb(new errors.NotFoundError())
+          let success = false
+          result.paths.forEach((result) => {
+            if (result.success) {
+              success = true
+              this.peerBook.put(result.peer)
+            }
+          })
+          this._log('findPeer %s: %s', id.toB58String(), success)
+          if (!success) {
+            return cb(errcode(new Error('No peer found'), 'ERR_NOT_FOUND'))
           }
-          cb(null, result.peer)
+          cb(null, this.peerBook.get(id))
         }
       ], callback)
     })

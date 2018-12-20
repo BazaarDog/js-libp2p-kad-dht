@@ -7,13 +7,14 @@ const timeout = require('async/timeout')
 const multihashing = require('multihashing-async')
 const PeerId = require('peer-id')
 const assert = require('assert')
-const errors = require('./errors')
 const c = require('./constants')
+
+const errcode = require('err-code')
 
 class RandomWalk {
   constructor (kadDHT) {
     assert(kadDHT, 'Random Walk needs an instance of the Kademlia DHT')
-    this._running = false
+    this._runningHandle = null
     this._kadDHT = kadDHT
   }
 
@@ -24,43 +25,80 @@ class RandomWalk {
    *
    * @param {number} [queries=1] - how many queries to run per period
    * @param {number} [period=300000] - how often to run the the random-walk process, in milliseconds (5min)
-   * @param {number} [maxTimeout=10000] - how long to wait for the the random-walk query to run, in milliseconds (10s)
+   * @param {number} [timeout=10000] - how long to wait for the the random-walk query to run, in milliseconds (10s)
    * @returns {void}
    */
-  start (queries, period, maxTimeout) {
+  start (queries, period, timeout) {
     if (queries == null) { queries = 1 }
     if (period == null) { period = 5 * c.minute }
-    if (maxTimeout == null) { maxTimeout = 10 * c.second }
+    if (timeout == null) { timeout = 10 * c.second }
     // Don't run twice
     if (this._running) { return }
 
-    this._running = setInterval(
-      () => this._walk(queries, maxTimeout),
-      period
-    )
+    // Create running handle
+    const runningHandle = {
+      _onCancel: null,
+      _timeoutId: null,
+      runPeriodically: (fn, period) => {
+        runningHandle._timeoutId = setTimeout(() => {
+          runningHandle._timeoutId = null
+
+          fn((nextPeriod) => {
+            // Was walk cancelled while fn was being called?
+            if (runningHandle._onCancel) {
+              return runningHandle._onCancel()
+            }
+            // Schedule next
+            runningHandle.runPeriodically(fn, nextPeriod)
+          })
+        }, period)
+      },
+      cancel: (cb) => {
+        // Not currently running, can callback immediately
+        if (runningHandle._timeoutId) {
+          clearTimeout(runningHandle._timeoutId)
+          return cb()
+        }
+        // Wait to finish and then call callback
+        runningHandle._onCancel = cb
+      }
+    }
+
+    // Start runner
+    runningHandle.runPeriodically((done) => {
+      this._walk(queries, timeout, () => done(period))
+    }, period)
+    this._runningHandle = runningHandle
   }
 
   /**
    * Stop the random-walk process.
+   * @param {function(Error)} callback
    *
    * @returns {void}
    */
-  stop () {
-    if (this._running) {
-      clearInterval(this._running)
+  stop (callback) {
+    const runningHandle = this._runningHandle
+
+    if (!runningHandle) {
+      return callback()
     }
+
+    this._runningHandle = null
+    runningHandle.cancel(callback)
   }
 
   /**
    * Do the random walk work.
    *
    * @param {number} queries
-   * @param {number} maxTimeout
+   * @param {number} walkTimeout
+   * @param {function(Error)} callback
    * @returns {void}
    *
    * @private
    */
-  _walk (queries, maxTimeout) {
+  _walk (queries, walkTimeout, callback) {
     this._kadDHT._log('random-walk:start')
 
     times(queries, (i, cb) => {
@@ -68,11 +106,15 @@ class RandomWalk {
         (cb) => this._randomPeerId(cb),
         (id, cb) => timeout((cb) => {
           this._query(id, cb)
-        }, maxTimeout)(cb)
+        }, walkTimeout)(cb)
       ], (err) => {
-        if (err) { return this._kadDHT._log.error('random-walk:error', err) }
+        if (err) {
+          this._kadDHT._log.error('random-walk:error', err)
+          return callback(err)
+        }
 
         this._kadDHT._log('random-walk:done')
+        callback(null)
       })
     })
   }
@@ -90,7 +132,7 @@ class RandomWalk {
     this._kadDHT._log('random-walk:query:%s', id.toB58String())
 
     this._kadDHT.findPeer(id, (err, peer) => {
-      if (err instanceof errors.NotFoundError) {
+      if (err.code === 'ERR_NOT_FOUND') {
         // expected case, we asked for random stuff after all
         return callback()
       }
@@ -100,7 +142,7 @@ class RandomWalk {
       this._kadDHT._log('random-walk:query:found', err, peer)
 
       // wait what, there was something found? Lucky day!
-      callback(new Error(`random-walk: ACTUALLY FOUND PEER: ${peer}, ${id.toB58String()}`))
+      callback(errcode(new Error(`random-walk: ACTUALLY FOUND PEER: ${peer}, ${id.toB58String()}`), 'ERR_FOUND_RANDOM_PEER'))
     })
   }
 

@@ -4,6 +4,7 @@
 const chai = require('chai')
 chai.use(require('dirty-chai'))
 const expect = chai.expect
+const sinon = require('sinon')
 const series = require('async/series')
 const times = require('async/times')
 const parallel = require('async/parallel')
@@ -18,6 +19,8 @@ const PeerBook = require('peer-book')
 const Switch = require('libp2p-switch')
 const TCP = require('libp2p-tcp')
 const Mplex = require('libp2p-mplex')
+
+const errcode = require('err-code')
 
 const KadDHT = require('../src')
 const kadUtils = require('../src/utils')
@@ -69,11 +72,12 @@ function connect (a, b, callback) {
 
 function bootstrap (dhts) {
   dhts.forEach((dht) => {
-    dht.randomWalk._walk(3, 10000)
+    // dht.randomWalk._walk(3, 10000, () => {}) // don't need to know when it finishes
+    dht.randomWalk.start(1, 1000) // don't need to know when it finishes
   })
 }
 
-function waitForWellFormedTables (dhts, minPeers, avgPeers, maxTimeout, callback) {
+function waitForWellFormedTables (dhts, minPeers, avgPeers, waitTimeout, callback) {
   timeout((cb) => {
     retry({ times: 50, interval: 200 }, (cb) => {
       let totalPeers = 0
@@ -94,7 +98,7 @@ function waitForWellFormedTables (dhts, minPeers, avgPeers, maxTimeout, callback
       const done = ready.every(Boolean)
       cb(done ? null : new Error('not done yet'))
     }, cb)
-  }, maxTimeout)(callback)
+  }, waitTimeout)(callback)
 }
 
 function countDiffPeers (a, b) {
@@ -135,6 +139,122 @@ describe('KadDHT', () => {
     expect(dht).to.have.property('routingTable')
   })
 
+  it('create with validators and selectors', () => {
+    const sw = new Switch(peerInfos[0], new PeerBook())
+    sw.transport.add('tcp', new TCP())
+    sw.connection.addStreamMuxer(Mplex)
+    sw.connection.reuse()
+    const dht = new KadDHT(sw, {
+      validators: {
+        ipns: {
+          func: (key, record, cb) => cb()
+        }
+      },
+      selectors: {
+        ipns: (key, records) => 0
+      }
+    })
+
+    expect(dht).to.have.property('peerInfo').eql(peerInfos[0])
+    expect(dht).to.have.property('switch').eql(sw)
+    expect(dht).to.have.property('routingTable')
+    expect(dht.validators).to.have.property('ipns')
+    expect(dht.selectors).to.have.property('ipns')
+  })
+
+  it('should be able to start and stop', function (done) {
+    const sw = new Switch(peerInfos[0], new PeerBook())
+    sw.transport.add('tcp', new TCP())
+    sw.connection.addStreamMuxer(Mplex)
+    sw.connection.reuse()
+    const dht = new KadDHT(sw)
+
+    sinon.spy(dht.network, 'start')
+    sinon.spy(dht.randomWalk, 'start')
+
+    sinon.spy(dht.network, 'stop')
+    sinon.spy(dht.randomWalk, 'stop')
+
+    series([
+      (cb) => dht.start(cb),
+      (cb) => {
+        expect(dht.network.start.calledOnce).to.equal(true)
+        expect(dht.randomWalk.start.calledOnce).to.equal(true)
+
+        cb()
+      },
+      (cb) => dht.stop(cb)
+    ], (err) => {
+      expect(err).to.not.exist()
+      expect(dht.network.stop.calledOnce).to.equal(true)
+      expect(dht.randomWalk.stop.calledOnce).to.equal(true)
+
+      done()
+    })
+  })
+
+  it('should be able to start with random-walk disabled', function (done) {
+    const sw = new Switch(peerInfos[0], new PeerBook())
+    sw.transport.add('tcp', new TCP())
+    sw.connection.addStreamMuxer(Mplex)
+    sw.connection.reuse()
+    const dht = new KadDHT(sw, { enabledDiscovery: false })
+
+    sinon.spy(dht.network, 'start')
+    sinon.spy(dht.randomWalk, 'start')
+
+    sinon.spy(dht.network, 'stop')
+    sinon.spy(dht.randomWalk, 'stop')
+
+    series([
+      (cb) => dht.start(cb),
+      (cb) => {
+        expect(dht.network.start.calledOnce).to.equal(true)
+        expect(dht.randomWalk.start.calledOnce).to.equal(false)
+
+        cb()
+      },
+      (cb) => dht.stop(cb)
+    ], (err) => {
+      expect(err).to.not.exist()
+      expect(dht.network.stop.calledOnce).to.equal(true)
+      expect(dht.randomWalk.stop.calledOnce).to.equal(true) // Should be always disabled, as it can be started using the instance
+
+      done()
+    })
+  })
+
+  it('should fail to start when already started', function (done) {
+    const sw = new Switch(peerInfos[0], new PeerBook())
+    sw.transport.add('tcp', new TCP())
+    sw.connection.addStreamMuxer(Mplex)
+    sw.connection.reuse()
+    const dht = new KadDHT(sw, { enabledDiscovery: false })
+
+    series([
+      (cb) => dht.start(cb),
+      (cb) => dht.start(cb)
+    ], (err) => {
+      expect(err).to.exist()
+      done()
+    })
+  })
+
+  it('should fail to stop when was not started', function (done) {
+    const sw = new Switch(peerInfos[0], new PeerBook())
+    sw.transport.add('tcp', new TCP())
+    sw.connection.addStreamMuxer(Mplex)
+    sw.connection.reuse()
+    const dht = new KadDHT(sw, { enabledDiscovery: false })
+
+    series([
+      (cb) => dht.stop(cb)
+    ], (err) => {
+      expect(err).to.exist()
+      done()
+    })
+  })
+
   it('put - get', function (done) {
     this.timeout(10 * 1000)
     const tdht = new TestDHT()
@@ -147,7 +267,7 @@ describe('KadDHT', () => {
       waterfall([
         (cb) => connect(dhtA, dhtB, cb),
         (cb) => dhtA.put(Buffer.from('/v/hello'), Buffer.from('world'), cb),
-        (cb) => dhtB.get(Buffer.from('/v/hello'), 1000, cb),
+        (cb) => dhtB.get(Buffer.from('/v/hello'), { timeout: 1000 }, cb),
         (res, cb) => {
           expect(res).to.eql(Buffer.from('world'))
           cb()
@@ -155,6 +275,118 @@ describe('KadDHT', () => {
       ], (err) => {
         expect(err).to.not.exist()
         tdht.teardown(done)
+      })
+    })
+  })
+
+  it('put - get using key with no prefix (no selector available)', function (done) {
+    this.timeout(10 * 1000)
+    const tdht = new TestDHT()
+
+    tdht.spawn(2, (err, dhts) => {
+      expect(err).to.not.exist()
+      const dhtA = dhts[0]
+      const dhtB = dhts[1]
+
+      waterfall([
+        (cb) => connect(dhtA, dhtB, cb),
+        (cb) => dhtA.put(Buffer.from('hello'), Buffer.from('world'), cb),
+        (cb) => dhtB.get(Buffer.from('hello'), { timeout: 1000 }, cb),
+        (res, cb) => {
+          expect(res).to.eql(Buffer.from('world'))
+          cb()
+        }
+      ], (err) => {
+        expect(err).to.not.exist()
+        tdht.teardown(done)
+      })
+    })
+  })
+
+  it('put - get using key from provided validator and selector', function (done) {
+    this.timeout(10 * 1000)
+    const tdht = new TestDHT()
+
+    tdht.spawn(2, {
+      validators: {
+        ipns: {
+          func: (key, record, cb) => cb()
+        }
+      },
+      selectors: {
+        ipns: (key, records) => 0
+      }
+    }, (err, dhts) => {
+      expect(err).to.not.exist()
+      const dhtA = dhts[0]
+      const dhtB = dhts[1]
+
+      waterfall([
+        (cb) => connect(dhtA, dhtB, cb),
+        (cb) => dhtA.put(Buffer.from('/ipns/hello'), Buffer.from('world'), cb),
+        (cb) => dhtB.get(Buffer.from('/ipns/hello'), { timeout: 1000 }, cb),
+        (res, cb) => {
+          expect(res).to.eql(Buffer.from('world'))
+          cb()
+        }
+      ], (err) => {
+        expect(err).to.not.exist()
+        tdht.teardown(done)
+      })
+    })
+  })
+
+  it('put - get should fail if unrecognized key prefix in get', function (done) {
+    this.timeout(10 * 1000)
+    const tdht = new TestDHT()
+
+    tdht.spawn(2, (err, dhts) => {
+      expect(err).to.not.exist()
+      const dhtA = dhts[0]
+      const dhtB = dhts[1]
+
+      waterfall([
+        (cb) => connect(dhtA, dhtB, cb),
+        (cb) => dhtA.put(Buffer.from('/v2/hello'), Buffer.from('world'), cb),
+        (cb) => dhtB.get(Buffer.from('/v2/hello'), { timeout: 1000 }, cb)
+      ], (err) => {
+        expect(err).to.exist()
+        expect(err.code).to.eql('ERR_UNRECOGNIZED_KEY_PREFIX')
+        tdht.teardown(done)
+      })
+    })
+  })
+
+  it('put - get with update', function (done) {
+    this.timeout(20 * 1000)
+    const tdht = new TestDHT()
+
+    tdht.spawn(2, (err, dhts) => {
+      expect(err).to.not.exist()
+      const dhtA = dhts[0]
+      const dhtB = dhts[1]
+
+      const dhtASpy = sinon.spy(dhtA, '_putValueToPeer')
+
+      series([
+        (cb) => dhtA.put(Buffer.from('/v/hello'), Buffer.from('worldA'), cb),
+        (cb) => dhtB.put(Buffer.from('/v/hello'), Buffer.from('worldB'), cb),
+        (cb) => connect(dhtA, dhtB, cb)
+      ], (err) => {
+        expect(err).to.not.exist()
+
+        series([
+          (cb) => dhtA.get(Buffer.from('/v/hello'), { timeout: 1000 }, cb),
+          (cb) => dhtB.get(Buffer.from('/v/hello'), { timeout: 1000 }, cb)
+        ], (err, results) => {
+          expect(err).to.not.exist()
+          results.forEach((res) => {
+            expect(res).to.eql(Buffer.from('worldA')) // first is selected
+          })
+          expect(dhtASpy.callCount).to.eql(1)
+          expect(dhtASpy.getCall(0).args[2].isEqual(dhtB.peerInfo.id)).to.eql(true) // inform B
+          tdht.teardown(done)
+        })
       })
     })
   })
@@ -180,7 +412,7 @@ describe('KadDHT', () => {
           let n = 0
           each(values, (v, cb) => {
             n = (n + 1) % 3
-            dhts[n].findProviders(v.cid, 5000, (err, provs) => {
+            dhts[n].findProviders(v.cid, { timeout: 5000 }, (err, provs) => {
               expect(err).to.not.exist()
               expect(provs).to.have.length(1)
               expect(provs[0].id.id).to.be.eql(ids[3].id)
@@ -200,13 +432,45 @@ describe('KadDHT', () => {
     })
   })
 
+  it('find providers', function (done) {
+    this.timeout(20 * 1000)
+
+    const val = values[0]
+    const tdht = new TestDHT()
+
+    tdht.spawn(3, (err, dhts) => {
+      expect(err).to.not.exist()
+
+      series([
+        (cb) => connect(dhts[0], dhts[1], cb),
+        (cb) => connect(dhts[1], dhts[2], cb),
+        (cb) => each(dhts, (dht, cb) => dht.provide(val.cid, cb), cb),
+        (cb) => dhts[0].findProviders(val.cid, {}, cb),
+        (cb) => dhts[0].findProviders(val.cid, { maxNumProviders: 2 }, cb)
+      ], (err, res) => {
+        expect(err).to.not.exist()
+
+        // find providers find all the 3 providers
+        expect(res[3]).to.exist()
+        expect(res[3]).to.have.length(3)
+
+        // find providers limited to a maxium of 2 providers
+        expect(res[4]).to.exist()
+        expect(res[4]).to.have.length(2)
+
+        done()
+      })
+    })
+  })
+
   it('random-walk', function (done) {
     this.timeout(40 * 1000)
 
     const nDHTs = 20
     const tdht = new TestDHT()
 
-    tdht.spawn(nDHTs, (err, dhts) => {
+    // random walk disabled for a manual usage
+    tdht.spawn(nDHTs, { enabledDiscovery: false }, (err, dhts) => {
       expect(err).to.not.exist()
 
       series([
@@ -217,7 +481,6 @@ describe('KadDHT', () => {
         (cb) => {
           bootstrap(dhts)
           waitForWellFormedTables(dhts, 7, 0, 20 * 1000, cb)
-          cb()
         }
       ], (err) => {
         expect(err).to.not.exist()
@@ -244,7 +507,7 @@ describe('KadDHT', () => {
           Buffer.from('world'),
           cb
         ),
-        (cb) => dhts[0].get(Buffer.from('/v/hello'), 1000, cb),
+        (cb) => dhts[0].get(Buffer.from('/v/hello'), { timeout: 1000 }, cb),
         (res, cb) => {
           expect(res).to.eql(Buffer.from('world'))
           cb()
@@ -256,7 +519,7 @@ describe('KadDHT', () => {
     })
   })
 
-  it.skip('findPeer', function (done) {
+  it('findPeer', function (done) {
     this.timeout(40 * 1000)
 
     const nDHTs = 4
@@ -271,7 +534,7 @@ describe('KadDHT', () => {
         (cb) => connect(dhts[0], dhts[1], cb),
         (cb) => connect(dhts[1], dhts[2], cb),
         (cb) => connect(dhts[2], dhts[3], cb),
-        (cb) => dhts[0].findPeer(ids[3], 1000, cb),
+        (cb) => dhts[0].findPeer(ids[3], { timeout: 1000 }, cb),
         (res, cb) => {
           expect(res.id.isEqual(ids[3])).to.eql(true)
           cb()
@@ -309,8 +572,7 @@ describe('KadDHT', () => {
     })
   })
 
-  // TODO fix this
-  it.skip('find peer query', function (done) {
+  it('find peer query', function (done) {
     this.timeout(40 * 1000)
 
     const nDHTs = 101
@@ -324,15 +586,18 @@ describe('KadDHT', () => {
       const guy = dhts[0]
       const others = dhts.slice(1)
       const val = Buffer.from('foobar')
+      const connected = {} // indexes in others that are reachable from guy
 
       series([
         (cb) => times(20, (i, cb) => {
           times(16, (j, cb) => {
             const t = 20 + random(79)
+            connected[t] = true
             connect(others[i], others[t], cb)
           }, cb)
         }, cb),
         (cb) => times(20, (i, cb) => {
+          connected[i] = true
           connect(guy, others[i], cb)
         }, cb),
         (cb) => kadUtils.convertBuffer(val, (err, rtval) => {
@@ -348,9 +613,11 @@ describe('KadDHT', () => {
             rtableSet[p.toB58String()] = true
           })
 
+          const connectedIds = ids.slice(1).filter((id, i) => connected[i])
+
           series([
             (cb) => guy.getClosestPeers(val, cb),
-            (cb) => kadUtils.sortClosestPeers(ids.slice(1), rtval, cb)
+            (cb) => kadUtils.sortClosestPeers(connectedIds, rtval, cb)
           ], (err, res) => {
             expect(err).to.not.exist()
             const out = res[0]
@@ -492,33 +759,69 @@ describe('KadDHT', () => {
     })
   })
 
-  describe('_verifyRecordLocally', () => {
-    it('invalid record (missing public key)', (done) => {
+  describe('_checkLocalDatastore', () => {
+    it('allow a peer record from store if recent', (done) => {
       const sw = new Switch(peerInfos[0], new PeerBook())
       sw.transport.add('tcp', new TCP())
       sw.connection.addStreamMuxer(Mplex)
       sw.connection.reuse()
       const dht = new KadDHT(sw)
 
-      // Not putting the peer info into the peerbook
-      // dht.peerBook.put(peerInfos[1])
+      const record = new Record(
+        Buffer.from('hello'),
+        Buffer.from('world')
+      )
+      record.timeReceived = new Date()
+
+      waterfall([
+        (cb) => dht._putLocal(record.key, record.serialize(), cb),
+        (cb) => dht._checkLocalDatastore(record.key, cb)
+      ], (err, rec) => {
+        expect(err).to.not.exist()
+        expect(rec).to.exist('Record should not have expired')
+        expect(rec.value.toString()).to.equal(record.value.toString())
+        done()
+      })
+    })
+    it('delete entries received from peers that have expired', (done) => {
+      const sw = new Switch(peerInfos[0], new PeerBook())
+      sw.transport.add('tcp', new TCP())
+      sw.connection.addStreamMuxer(Mplex)
+      sw.connection.reuse()
+      const dht = new KadDHT(sw)
 
       const record = new Record(
         Buffer.from('hello'),
-        Buffer.from('world'),
-        peerInfos[1].id
+        Buffer.from('world')
       )
+      let received = new Date()
+      received.setDate(received.getDate() - 2)
+
+      record.timeReceived = received
 
       waterfall([
-        (cb) => record.serializeSigned(peerInfos[1].id.privKey, cb),
-        (enc, cb) => dht._verifyRecordLocally(Record.deserialize(enc), (err) => {
-          expect(err).to.match(/Missing public key/)
+        (cb) => dht._putLocal(record.key, record.serialize(), cb),
+        (cb) => dht.datastore.get(kadUtils.bufferToKey(record.key), cb),
+        (lookup, cb) => {
+          expect(lookup).to.exist('Record should be in the local datastore')
           cb()
+        },
+        (cb) => dht._checkLocalDatastore(record.key, cb)
+      ], (err, rec) => {
+        expect(err).to.not.exist()
+        expect(rec).to.not.exist('Record should have expired')
+
+        dht.datastore.get(kadUtils.bufferToKey(record.key), (err, lookup) => {
+          expect(err).to.exist('Should throw error for not existing')
+          expect(lookup).to.not.exist('Record should be removed from datastore')
+          done()
         })
-      ], done)
+      })
     })
+  })
 
-    it('valid record - signed', (done) => {
+  describe('_verifyRecordLocally', () => {
+    it('valid record', (done) => {
       const sw = new Switch(peerInfos[0], new PeerBook())
       sw.transport.add('tcp', new TCP())
       sw.connection.addStreamMuxer(Mplex)
@@ -529,35 +832,118 @@ describe('KadDHT', () => {
 
       const record = new Record(
         Buffer.from('hello'),
-        Buffer.from('world'),
-        peerInfos[1].id
-      )
-
-      waterfall([
-        (cb) => record.serializeSigned(peerInfos[1].id.privKey, cb),
-        (enc, cb) => dht._verifyRecordLocally(Record.deserialize(enc), cb)
-      ], done)
-    })
-
-    it('valid record - not signed', (done) => {
-      const sw = new Switch(peerInfos[0], new PeerBook())
-      sw.transport.add('tcp', new TCP())
-      sw.connection.addStreamMuxer(Mplex)
-      sw.connection.reuse()
-      const dht = new KadDHT(sw)
-
-      dht.peerBook.put(peerInfos[1])
-
-      const record = new Record(
-        Buffer.from('hello'),
-        Buffer.from('world'),
-        peerInfos[1].id
+        Buffer.from('world')
       )
 
       waterfall([
         (cb) => cb(null, record.serialize()),
         (enc, cb) => dht._verifyRecordLocally(Record.deserialize(enc), cb)
       ], done)
+    })
+  })
+
+  describe('errors', () => {
+    it('get many should fail if only has one peer', function (done) {
+      this.timeout(20 * 1000)
+
+      const nDHTs = 1
+      const tdht = new TestDHT()
+
+      tdht.spawn(nDHTs, (err, dhts) => {
+        expect(err).to.not.exist()
+
+        dhts[0].getMany('/v/hello', 5, (err) => {
+          expect(err).to.exist()
+          expect(err.code).to.be.eql('ERR_NO_PEERS_IN_ROUTING_TABLE')
+          tdht.teardown(done)
+        })
+      })
+    })
+
+    it('get should handle correctly an unexpected error', function (done) {
+      this.timeout(20 * 1000)
+
+      const errCode = 'ERR_INVALID_RECORD_FAKE'
+      const error = errcode(new Error('fake error'), errCode)
+
+      const nDHTs = 2
+      const tdht = new TestDHT()
+
+      tdht.spawn(nDHTs, (err, dhts) => {
+        expect(err).to.not.exist()
+
+        const dhtA = dhts[0]
+        const dhtB = dhts[1]
+        const stub = sinon.stub(dhtA, '_getValueOrPeers').callsArgWithAsync(2, error)
+
+        waterfall([
+          (cb) => connect(dhtA, dhtB, cb),
+          (cb) => dhtA.get(Buffer.from('/v/hello'), { timeout: 1000 }, cb)
+        ], (err) => {
+          expect(err).to.exist()
+          expect(err.code).to.be.eql(errCode)
+
+          stub.restore()
+          tdht.teardown(done)
+        })
+      })
+    })
+
+    it('get should handle correctly an invalid record error and return not found', function (done) {
+      this.timeout(20 * 1000)
+
+      const error = errcode(new Error('invalid record error'), 'ERR_INVALID_RECORD')
+
+      const nDHTs = 2
+      const tdht = new TestDHT()
+
+      tdht.spawn(nDHTs, (err, dhts) => {
+        expect(err).to.not.exist()
+
+        const dhtA = dhts[0]
+        const dhtB = dhts[1]
+        const stub = sinon.stub(dhtA, '_getValueOrPeers').callsArgWithAsync(2, error)
+
+        waterfall([
+          (cb) => connect(dhtA, dhtB, cb),
+          (cb) => dhtA.get(Buffer.from('/v/hello'), cb)
+        ], (err) => {
+          expect(err).to.exist()
+          expect(err.code).to.be.eql('ERR_NOT_FOUND')
+
+          stub.restore()
+          tdht.teardown(done)
+        })
+      })
+    })
+
+    it('findPeer should fail if no closest peers available', function (done) {
+      this.timeout(40 * 1000)
+
+      const nDHTs = 4
+      const tdht = new TestDHT()
+
+      tdht.spawn(nDHTs, (err, dhts) => {
+        expect(err).to.not.exist()
+
+        const ids = dhts.map((d) => d.peerInfo.id)
+
+        waterfall([
+          (cb) => connect(dhts[0], dhts[1], cb),
+          (cb) => connect(dhts[1], dhts[2], cb),
+          (cb) => connect(dhts[2], dhts[3], cb)
+        ], (err) => {
+          expect(err).to.not.exist()
+          const stub = sinon.stub(dhts[0].routingTable, 'closestPeers').returns([])
+
+          dhts[0].findPeer(ids[3], { timeout: 1000 }, (err) => {
+            expect(err).to.exist()
+            expect(err.code).to.eql('ERR_LOOKUP_FAILED')
+            stub.restore()
+            tdht.teardown(done)
+          })
+        })
+      })
     })
   })
 })

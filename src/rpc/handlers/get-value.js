@@ -3,6 +3,8 @@
 const parallel = require('async/parallel')
 const Record = require('libp2p-record').Record
 
+const errcode = require('err-code')
+
 const Message = require('../../message')
 const utils = require('../../utils')
 
@@ -20,10 +22,10 @@ module.exports = (dht) => {
   return function getValue (peer, msg, callback) {
     const key = msg.key
 
-    log('key: %s', key)
+    log('key: %b', key)
 
     if (!key || key.length === 0) {
-      return callback(new Error('Invalid key'))
+      return callback(errcode(new Error('Invalid key'), 'ERR_INVALID_KEY'))
     }
 
     const response = new Message(Message.TYPES.GET_VALUE, key, msg.clusterLevel)
@@ -41,7 +43,7 @@ module.exports = (dht) => {
 
       if (info && info.id.pubKey) {
         log('returning found public key')
-        response.record = new Record(key, info.id.pubKey.bytes, dht.peerInfo.id)
+        response.record = new Record(key, info.id.pubKey.bytes)
         return callback(null, response)
       }
     }

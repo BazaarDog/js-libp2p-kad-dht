@@ -46,7 +46,7 @@ describe('rpc - handlers - GetValue', () => {
     const msg = new Message(T, Buffer.alloc(0), 0)
 
     handler(dht)(peers[0], msg, (err, response) => {
-      expect(err).to.match(/Invalid key/)
+      expect(err.code).to.eql('ERR_INVALID_KEY')
       expect(response).to.not.exist()
       done()
     })
@@ -56,7 +56,6 @@ describe('rpc - handlers - GetValue', () => {
     const key = Buffer.from('hello')
     const value = Buffer.from('world')
     const msg = new Message(T, key, 0)
-
     waterfall([
       (cb) => dht.put(key, value, cb),
       (cb) => handler(dht)(peers[0], msg, cb)
