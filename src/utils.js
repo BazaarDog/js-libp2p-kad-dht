@@ -2,6 +2,7 @@
 
 const debug = require('debug')
 const multihashing = require('multihashing-async')
+const mh = require('multihashes')
 const Key = require('interface-datastore').Key
 const base32 = require('base32.js')
 const distance = require('xor-distance')
@@ -133,21 +134,28 @@ exports.xorCompare = (a, b) => {
 }
 
 /**
+ * Computes how many results to collect on each disjoint path, rounding up.
+ * This ensures that we look for at least one result per path.
+ *
+ * @param {number} resultsWanted
+ * @param {number} numPaths - total number of paths
+ * @returns {number}
+ */
+exports.pathSize = (resultsWanted, numPaths) => {
+  return Math.ceil(resultsWanted / numPaths)
+}
+
+/**
  * Create a new put record, encodes and signs it if enabled.
  *
  * @param {Buffer} key
  * @param {Buffer} value
- * @param {PeerId} peer
- * @param {bool} sign - Should the record be signed
  * @param {function(Error, Buffer)} callback
  * @returns {void}
  */
-exports.createPutRecord = (key, value, peer, sign, callback) => {
-  const rec = new Record(key, value, peer)
-
-  if (sign) {
-    return rec.serializeSigned(peer.privKey, callback)
-  }
+exports.createPutRecord = (key, value, callback) => {
+  const timeReceived = new Date()
+  const rec = new Record(key, value, timeReceived)
 
   setImmediate(() => {
     callback(null, rec.serialize())
@@ -171,6 +179,12 @@ exports.logger = (id, subsystem) => {
   if (id) {
     name.push(`${id.toB58String().slice(0, 8)}`)
   }
+
+  // Add a formatter for converting to a base58 string
+  debug.formatters.b = (v) => {
+    return mh.toB58String(v)
+  }
+
   const logger = debug(name.join(':'))
   logger.error = debug(name.concat(['error']).join(':'))
 
